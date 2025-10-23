@@ -9,31 +9,12 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QGridLayout, QPushButton, QScrollArea,
                              QLabel, QMessageBox, QLineEdit, QFrame)
 from PyQt6.QtCore import Qt, QTimer, QPoint, QSize, QRectF
-from PyQt6.QtGui import QIcon, QPalette, QColor, QFont, QPainter, QMouseEvent
+from PyQt6.QtGui import QIcon, QPalette, QColor, QFont, QPainter, QMouseEvent, QPixmap
 from PyQt6.QtSvg import QSvgRenderer
+from svg_icons import SVG_ICONS
+from custom_folder_dialog import CustomFolderDialog
 
 logging.basicConfig(filename='launcher.log', level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', filemode='w')
-
-SVG_ICONS = {
-    "minimize": """<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-<path d="M20 12H4" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-</svg>""",
-    "maximize": """<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-<path d="M8 3H5C3.89543 3 3 3.89543 3 5V8" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-<path d="M16 3H19C20.1046 3 21 3.89543 21 5V8" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-<path d="M8 21H5C3.89543 21 3 20.1046 3 19V16" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-<path d="M16 21H19C20.1046 21 21 20.1046 21 19V16" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-</svg>""",
-    "restore": """<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-<path d="M8 21H5C3.89543 21 3 20.1046 3 19V14" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-<path d="M21 10V5C21 3.89543 20.1046 3 19 3H14" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-<path d="M10 21V19C10 17.8954 10.8954 17 12 17H19C20.1046 17 21 17.8954 21 19V21H10Z" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-</svg>""",
-    "close": """<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-<path d="M18 6L6 18" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-<path d="M6 6L18 18" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-</svg>"""
-}
 
 class TitleBarButton(QPushButton):
     def __init__(self, icon_name, parent=None):
@@ -117,7 +98,7 @@ def get_vscode_projects():
         cleaned_paths = []
         for uri in project_uris:
             if uri.startswith('file:///'):
-                path = unquote(uri[8:]).replace('/', '\\')
+                path = unquote(uri[8:]).replace('/', '\\\\')
                 cleaned_paths.append(path)
         folder_paths = [p for p in cleaned_paths if os.path.isdir(p)]
         return sorted(folder_paths, key=lambda p: os.path.getmtime(p) if os.path.exists(p) else 0, reverse=True)
@@ -125,18 +106,42 @@ def get_vscode_projects():
         logging.critical(f"An unhandled exception in get_vscode_projects: {e}", exc_info=True)
         return []
 
+def find_project_icon(project_path):
+    try:
+        for item in os.listdir(project_path):
+            if item.lower().endswith('.ico'):
+                return os.path.join(project_path, item)
+    except FileNotFoundError:
+        logging.warning(f"Project path not found while searching for icon: {project_path}")
+    except Exception as e:
+        logging.error(f"Error searching for icon in {project_path}: {e}")
+    return None
+
 class ProjectButton(QPushButton):
-    def __init__(self, project_name, project_path, parent=None):
+    def __init__(self, project_name, project_path, icon_path=None, parent=None):
         super().__init__(parent)
         self.setFixedSize(180, 160)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         layout = QVBoxLayout(self)
         layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.setSpacing(12)
-        icon_label = QLabel("📁")
+        
+        icon_label = QLabel()
         icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        icon_label.setStyleSheet("font-size: 48px;")
+
+        if icon_path:
+            pixmap = QPixmap(icon_path)
+            if not pixmap.isNull():
+                icon_label.setPixmap(pixmap.scaled(48, 48, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+            else:
+                icon_label.setText("📁")
+                icon_label.setStyleSheet("font-size: 48px;")
+        else:
+            icon_label.setText("📁")
+            icon_label.setStyleSheet("font-size: 48px;")
+            
         layout.addWidget(icon_label)
+        
         name_label = QLabel(project_name)
         name_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         name_label.setWordWrap(True)
@@ -163,7 +168,9 @@ class ProjectButton(QPushButton):
 class VSCodeLauncher(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.projects = get_vscode_projects()
+        self.ignored_folders = self.load_ignored_folders()
+        self.all_projects = get_vscode_projects()
+        self.projects = [p for p in self.all_projects if p not in self.ignored_folders]
         self.filtered_projects = self.projects.copy()
 
         self.resize_timer = QTimer(self)
@@ -173,6 +180,29 @@ class VSCodeLauncher(QMainWindow):
 
         self.drag_pos = QPoint()
         self.init_ui()
+
+    def load_ignored_folders(self):
+        try:
+            with open('ignored_folders.json', 'r') as f:
+                return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return []
+
+    def save_ignored_folders(self):
+        with open('ignored_folders.json', 'w') as f:
+            json.dump(self.ignored_folders, f, indent=4)
+
+    def add_ignored_folder(self):
+        dialog = CustomFolderDialog(self.all_projects, self.ignored_folders, self)
+        if dialog.exec():
+            self.ignored_folders = dialog.selected_paths()
+            self.save_ignored_folders()
+            self.refresh_projects()
+
+    def refresh_projects(self):
+        self.projects = [p for p in self.all_projects if p not in self.ignored_folders]
+        self.filter_projects()
+
 
     def init_ui(self):
         self.setWindowTitle("VS Code Project Launcher")
@@ -236,17 +266,25 @@ class VSCodeLauncher(QMainWindow):
         title.setStyleSheet("font-size: 18px; font-weight: 600; color: white; background: transparent;")
         layout.addWidget(title)
         layout.addStretch()
+
         self.count_label = QLabel(f"{len(self.projects)} projects")
         self.count_label.setStyleSheet("font-size: 13px; color: rgba(255, 255, 255, 0.8); background: transparent; margin-right: 20px;")
         layout.addWidget(self.count_label)
-
-        controls_layout = QHBoxLayout()
-        controls_layout.setSpacing(0)
+        
         btn_style = """
             QPushButton { background-color: transparent; border-radius: 5px; }
             QPushButton:hover { background-color: rgba(255, 255, 255, 0.2); }
             QPushButton:pressed { background-color: rgba(255, 255, 255, 0.1); }
         """
+
+        settings_btn = TitleBarButton("ignore")
+        settings_btn.setStyleSheet(btn_style)
+        settings_btn.clicked.connect(self.add_ignored_folder)
+        layout.addWidget(settings_btn)
+
+        controls_layout = QHBoxLayout()
+        controls_layout.setSpacing(0)
+
         minimize_btn = TitleBarButton("minimize")
         minimize_btn.setStyleSheet(btn_style)
         minimize_btn.clicked.connect(self.showMinimized)
@@ -320,7 +358,8 @@ class VSCodeLauncher(QMainWindow):
 
         for i, project_path in enumerate(self.filtered_projects):
             row, col = i // cols, i % cols
-            btn = ProjectButton(os.path.basename(project_path), project_path)
+            icon_path = find_project_icon(project_path)
+            btn = ProjectButton(os.path.basename(project_path), project_path, icon_path=icon_path)
             btn.clicked.connect(lambda checked, p=project_path: self.open_project(p))
             self.grid_layout.addWidget(btn, row, col)
     

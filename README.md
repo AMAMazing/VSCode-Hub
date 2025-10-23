@@ -9,6 +9,7 @@ A sleek, modern, and cross-platform GUI application for quickly launching your r
 - **Custom Frameless Window**: A custom title bar with minimize, maximize, and close controls.
 - **Dynamic Grid Layout**: Projects are displayed in a responsive grid that adjusts to the window size.
 - **Search Functionality**: Instantly filter projects by name with the built-in search bar.
+- **Ignore Folders**: A settings menu to select and hide specific projects from the main view. Your preferences are saved in an `ignored_folders.json` file.
 - **Cross-Platform**: Designed to work on Windows, with potential for macOS and Linux compatibility.
 
 ## Prerequisites
