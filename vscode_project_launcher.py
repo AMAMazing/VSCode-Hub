@@ -303,12 +303,18 @@ class VSCodeLauncher(QMainWindow):
     def toggle_maximize_restore(self):
         if self.isMaximized():
             self.showNormal()
-            self.maximize_btn.setIconName("maximize")
             self.background_frame.setStyleSheet("#backgroundFrame { background-color: #1e1e1e; border-radius: 15px; }")
+            self.header.setStyleSheet("""
+                QFrame { background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #007acc, stop:1 #005a9e);
+                         border-top-left-radius: 14px; border-top-right-radius: 14px; }
+            """)
         else:
             self.showMaximized()
-            self.maximize_btn.setIconName("restore")
             self.background_frame.setStyleSheet("#backgroundFrame { background-color: #1e1e1e; border-radius: 0px; }")
+            self.header.setStyleSheet("""
+                QFrame { background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #007acc, stop:1 #005a9e);
+                         border-top-left-radius: 0px; border-top-right-radius: 0px; }
+            """)
 
     def mousePressEvent(self, event: QMouseEvent):
         if event.button() == Qt.MouseButton.LeftButton:
