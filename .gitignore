@@ -123,3 +123,9 @@ cython_debug/
 # Custom files
 launcher.log
 ignored_folders.json
+launcher_config.json
+vscode_project_launcher.build
+vscode_project_launcher.dist
+vscode_project_launcher.onefile-build
+vscode_project_launcher.exe
+project_cache.json

@@ -8,13 +8,161 @@ from datetime import datetime
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QGridLayout, QPushButton, QScrollArea,
                              QLabel, QMessageBox, QLineEdit, QFrame)
-from PyQt6.QtCore import Qt, QTimer, QPoint, QSize, QRectF
+from PyQt6.QtCore import Qt, QTimer, QPoint, QSize, QRectF, QThread, pyqtSignal
 from PyQt6.QtGui import QIcon, QPalette, QColor, QFont, QPainter, QMouseEvent, QPixmap
 from PyQt6.QtSvg import QSvgRenderer
-from svg_icons import SVG_ICONS
-from custom_folder_dialog import CustomFolderDialog
+
+# Attempt imports for your custom modules
+try:
+    from svg_icons import SVG_ICONS
+    from custom_folder_dialog import CustomFolderDialog
+except ImportError:
+    # Fallback if running standalone for testing without local modules
+    SVG_ICONS = {} 
+    class CustomFolderDialog: pass
 
 logging.basicConfig(filename='launcher.log', level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', filemode='w')
+
+CACHE_FILE = 'project_cache.json'
+CONFIG_FILE = 'launcher_config.json'
+
+# --- WORKER THREAD FOR BACKGOUND LOADING ---
+class ProjectScannerWorker(QThread):
+    finished = pyqtSignal(list, str) # Returns project list and vscode path
+
+    def __init__(self, ignored_folders):
+        super().__init__()
+        self.ignored_folders = ignored_folders
+
+    def find_vscode_executable(self):
+        # Check config first
+        if os.path.exists(CONFIG_FILE):
+            try:
+                with open(CONFIG_FILE, 'r') as f:
+                    config = json.load(f)
+                    path = config.get('vscode_path')
+                    if path and os.path.exists(path):
+                        return path
+            except:
+                pass
+
+        logging.info("Searching for VS Code executable...")
+        appdata_path = os.environ.get('LOCALAPPDATA', '')
+        program_files = os.environ.get('ProgramFiles', '')
+        program_files_x86 = os.environ.get('ProgramFiles(x86)', '')
+        possible_paths = [
+            os.path.join(appdata_path, 'Programs', 'Microsoft VS Code', 'Code.exe'),
+            os.path.join(appdata_path, 'Programs', 'Microsoft VS Code', 'bin', 'code.cmd'),
+            os.path.join(program_files, 'Microsoft VS Code', 'Code.exe'),
+            os.path.join(program_files, 'Microsoft VS Code', 'bin', 'code.cmd'),
+        ]
+        if program_files_x86:
+            possible_paths.extend([
+                os.path.join(program_files_x86, 'Microsoft VS Code', 'Code.exe'),
+            ])
+        
+        found_path = None
+        for path in possible_paths:
+            if os.path.exists(path):
+                found_path = path
+                break
+        
+        if not found_path:
+            try:
+                result = subprocess.run(['where', 'code'], capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW)
+                first_path = result.stdout.strip().splitlines()[0]
+                if os.path.exists(first_path):
+                    found_path = first_path
+            except:
+                pass
+        
+        # Save to config if found
+        if found_path:
+            with open(CONFIG_FILE, 'w') as f:
+                json.dump({'vscode_path': found_path}, f)
+        
+        return found_path
+
+    def find_project_icon(self, project_path):
+        # Optimized: Only look for specific names instead of scanning entire dir
+        common_names = ['favicon.ico', 'icon.ico', 'logo.ico', 'app.ico']
+        try:
+            # Quick check for common names first (faster than listdir)
+            for name in common_names:
+                p = os.path.join(project_path, name)
+                if os.path.exists(p):
+                    return p
+            
+            # Fallback to listdir if specific names fail (slower but thorough)
+            # Limit to first 50 files to prevent hanging on massive folders
+            files = os.listdir(project_path)
+            for item in files[:50]: 
+                if item.lower().endswith('.ico'):
+                    return os.path.join(project_path, item)
+        except:
+            pass
+        return None
+
+    def run(self):
+        vscode_path = self.find_vscode_executable()
+        
+        try:
+            possible_paths = [
+                os.path.join(os.environ['APPDATA'], 'Code', 'User', 'globalStorage', 'storage.json'),
+                os.path.join(os.environ['APPDATA'], 'Code - Insiders', 'User', 'globalStorage', 'storage.json'),
+                os.path.join(os.environ['APPDATA'], 'VSCodium', 'User', 'globalStorage', 'storage.json')
+            ]
+            storage_path = None
+            for path in possible_paths:
+                if os.path.exists(path):
+                    storage_path = path
+                    break
+            
+            if not storage_path:
+                self.finished.emit([], vscode_path)
+                return
+
+            with open(storage_path, 'r', encoding='utf-8') as f:
+                storage_data = json.load(f)
+            
+            project_uris = list(storage_data.get('profileAssociations', {}).get('workspaces', {}).keys())
+            
+            final_projects = []
+            
+            for uri in project_uris:
+                if uri.startswith('file:///'):
+                    path = unquote(uri[8:]).replace('/', '\\\\')
+                    
+                    # Skip if ignored
+                    if path in self.ignored_folders:
+                        continue
+
+                    # Expensive OS checks happen here, in the background
+                    if os.path.isdir(path):
+                        mtime = os.path.getmtime(path)
+                        icon = self.find_project_icon(path)
+                        
+                        final_projects.append({
+                            "path": path,
+                            "name": os.path.basename(path),
+                            "mtime": mtime,
+                            "icon": icon
+                        })
+
+            # Sort by date modified
+            final_projects.sort(key=lambda x: x['mtime'], reverse=True)
+            
+            # Save to cache for next run
+            with open(CACHE_FILE, 'w') as f:
+                json.dump(final_projects, f)
+
+            self.finished.emit(final_projects, vscode_path)
+
+        except Exception as e:
+            logging.error(f"Scanner error: {e}")
+            self.finished.emit([], vscode_path)
+
+# --- UI CLASSES ---
 
 class TitleBarButton(QPushButton):
     def __init__(self, icon_name, parent=None):
@@ -26,100 +174,27 @@ class TitleBarButton(QPushButton):
 
     def setIconName(self, name):
         self._icon_name = name
-        self._renderer.load(SVG_ICONS[self._icon_name].encode('utf-8'))
+        if name in SVG_ICONS:
+            self._renderer.load(SVG_ICONS[self._icon_name].encode('utf-8'))
         self.update()
 
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        
         icon_size = self.iconSize()
         rect = self.rect()
         x = (rect.width() - icon_size.width()) / 2
         y = (rect.height() - icon_size.height()) / 2
-        
         target_rect = QRectF(x, y, icon_size.width(), icon_size.height())
         self._renderer.render(painter, target_rect)
 
     def iconSize(self):
         return QSize(16, 16)
 
-def find_vscode_executable():
-    logging.info("Searching for VS Code executable...")
-    appdata_path = os.environ.get('LOCALAPPDATA', '')
-    program_files = os.environ.get('ProgramFiles', '')
-    program_files_x86 = os.environ.get('ProgramFiles(x86)', '')
-    possible_paths = [
-        os.path.join(appdata_path, 'Programs', 'Microsoft VS Code', 'Code.exe'),
-        os.path.join(appdata_path, 'Programs', 'Microsoft VS Code', 'bin', 'code.cmd'),
-        os.path.join(program_files, 'Microsoft VS Code', 'Code.exe'),
-        os.path.join(program_files, 'Microsoft VS Code', 'bin', 'code.cmd'),
-    ]
-    if program_files_x86:
-        possible_paths.extend([
-            os.path.join(program_files_x86, 'Microsoft VS Code', 'Code.exe'),
-            os.path.join(program_files_x86, 'Microsoft VS Code', 'bin', 'code.cmd'),
-        ])
-    for path in possible_paths:
-        if os.path.exists(path):
-            logging.info(f"Found executable at: {path}")
-            return path
-    logging.info("Executable not found in common paths. Falling back to 'where code'.")
-    try:
-        result = subprocess.run(['where', 'code'], capture_output=True, text=True, check=True, creationflags=subprocess.CREATE_NO_WINDOW)
-        first_path = result.stdout.strip().splitlines()[0]
-        if os.path.exists(first_path):
-            logging.info(f"Found executable via 'where' command: {first_path}")
-            return first_path
-    except (subprocess.CalledProcessError, FileNotFoundError, IndexError) as e:
-        logging.error(f"'where code' command failed: {e}")
-    logging.error("VS Code executable not found anywhere.")
-    return None
-
-def get_vscode_projects():
-    try:
-        logging.info("Searching for projects file...")
-        possible_paths = [
-            os.path.join(os.environ['APPDATA'], 'Code', 'User', 'globalStorage', 'storage.json'),
-            os.path.join(os.environ['APPDATA'], 'Code - Insiders', 'User', 'globalStorage', 'storage.json'),
-            os.path.join(os.environ['APPDATA'], 'VSCodium', 'User', 'globalStorage', 'storage.json')
-        ]
-        storage_path = None
-        for path in possible_paths:
-            if os.path.exists(path):
-                storage_path = path
-                break
-        if not storage_path:
-            logging.error("Could not find storage.json in any known location.")
-            return []
-        with open(storage_path, 'r', encoding='utf-8') as f:
-            storage_data = json.load(f)
-        project_uris = list(storage_data.get('profileAssociations', {}).get('workspaces', {}).keys())
-        cleaned_paths = []
-        for uri in project_uris:
-            if uri.startswith('file:///'):
-                path = unquote(uri[8:]).replace('/', '\\\\')
-                cleaned_paths.append(path)
-        folder_paths = [p for p in cleaned_paths if os.path.isdir(p)]
-        return sorted(folder_paths, key=lambda p: os.path.getmtime(p) if os.path.exists(p) else 0, reverse=True)
-    except Exception as e:
-        logging.critical(f"An unhandled exception in get_vscode_projects: {e}", exc_info=True)
-        return []
-
-def find_project_icon(project_path):
-    try:
-        for item in os.listdir(project_path):
-            if item.lower().endswith('.ico'):
-                return os.path.join(project_path, item)
-    except FileNotFoundError:
-        logging.warning(f"Project path not found while searching for icon: {project_path}")
-    except Exception as e:
-        logging.error(f"Error searching for icon in {project_path}: {e}")
-    return None
-
 class ProjectButton(QPushButton):
-    def __init__(self, project_name, project_path, icon_path=None, parent=None):
+    def __init__(self, project_data, parent=None):
         super().__init__(parent)
+        self.project_path = project_data['path']
         self.setFixedSize(180, 160)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         layout = QVBoxLayout(self)
@@ -129,34 +204,31 @@ class ProjectButton(QPushButton):
         icon_label = QLabel()
         icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        if icon_path:
+        icon_path = project_data.get('icon')
+        if icon_path and os.path.exists(icon_path):
             pixmap = QPixmap(icon_path)
             if not pixmap.isNull():
                 icon_label.setPixmap(pixmap.scaled(48, 48, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
             else:
-                icon_label.setText("📁")
-                icon_label.setStyleSheet("font-size: 48px;")
+                self._set_default_icon(icon_label)
         else:
-            icon_label.setText("📁")
-            icon_label.setStyleSheet("font-size: 48px;")
+            self._set_default_icon(icon_label)
             
         layout.addWidget(icon_label)
         
-        name_label = QLabel(project_name)
+        name_label = QLabel(project_data['name'])
         name_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         name_label.setWordWrap(True)
         name_label.setStyleSheet("font-size: 13px; font-weight: 500; color: #e1e1e1;")
         layout.addWidget(name_label)
-        try:
-            mtime = os.path.getmtime(project_path)
-            date_str = datetime.fromtimestamp(mtime).strftime('%b %d, %Y')
-        except:
-            date_str = ""
-        if date_str:
+
+        if project_data.get('mtime'):
+            date_str = datetime.fromtimestamp(project_data['mtime']).strftime('%b %d, %Y')
             date_label = QLabel(date_str)
             date_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             date_label.setStyleSheet("font-size: 10px; color: #888;")
             layout.addWidget(date_label)
+
         self.setStyleSheet("""
             ProjectButton { background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #2d2d30, stop:1 #252526);
                            border: 1px solid #3e3e42; border-radius: 12px; padding: 16px; }
@@ -165,44 +237,85 @@ class ProjectButton(QPushButton):
             ProjectButton:pressed { background: #1e1e1e; border: 1px solid #0098ff; }
         """)
 
+    def _set_default_icon(self, label):
+        label.setText("📁")
+        label.setStyleSheet("font-size: 48px; color: #d4d4d4;")
+
 class VSCodeLauncher(QMainWindow):
     def __init__(self):
         super().__init__()
         self.ignored_folders = self.load_ignored_folders()
-        self.all_projects = get_vscode_projects()
-        self.projects = [p for p in self.all_projects if p not in self.ignored_folders]
-        self.filtered_projects = self.projects.copy()
+        self.projects_data = [] # List of dicts
+        self.vscode_exe = None
+        
+        self.drag_pos = QPoint()
+        self.init_ui()
+        
+        # 1. Load from cache immediately (Instant UI)
+        self.load_from_cache()
+        
+        # 2. Start background scanner to refresh data
+        self.scanner = ProjectScannerWorker(self.ignored_folders)
+        self.scanner.finished.connect(self.on_scan_finished)
+        self.scanner.start()
 
+        # Resize timer logic
         self.resize_timer = QTimer(self)
         self.resize_timer.setSingleShot(True)
         self.resize_timer.setInterval(100)
         self.resize_timer.timeout.connect(self.populate_projects)
 
-        self.drag_pos = QPoint()
-        self.init_ui()
-
     def load_ignored_folders(self):
         try:
             with open('ignored_folders.json', 'r') as f:
                 return json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError):
+        except:
             return []
 
     def save_ignored_folders(self):
         with open('ignored_folders.json', 'w') as f:
             json.dump(self.ignored_folders, f, indent=4)
 
+    def load_from_cache(self):
+        """Loads data from JSON so UI appears instantly"""
+        if os.path.exists(CACHE_FILE):
+            try:
+                with open(CACHE_FILE, 'r') as f:
+                    self.projects_data = json.load(f)
+                self.populate_projects()
+                self.count_label.setText(f"{len(self.projects_data)} projects (Cached)")
+            except Exception as e:
+                logging.error(f"Cache load failed: {e}")
+
+    def on_scan_finished(self, projects, vscode_path):
+        """Called when background thread finishes scanning files"""
+        self.vscode_exe = vscode_path
+        
+        # Check if data actually changed to avoid unnecessary repaint
+        current_paths = [p['path'] for p in self.projects_data]
+        new_paths = [p['path'] for p in projects]
+        
+        if current_paths != new_paths:
+            self.projects_data = projects
+            self.filter_projects() # Re-run filter/populate
+            self.count_label.setText(f"{len(self.projects_data)} projects")
+        else:
+             self.count_label.setText(f"{len(self.projects_data)} projects")
+
     def add_ignored_folder(self):
-        dialog = CustomFolderDialog(self.all_projects, self.ignored_folders, self)
-        if dialog.exec():
-            self.ignored_folders = dialog.selected_paths()
-            self.save_ignored_folders()
-            self.refresh_projects()
-
-    def refresh_projects(self):
-        self.projects = [p for p in self.all_projects if p not in self.ignored_folders]
-        self.filter_projects()
-
+        # Passing simple list of paths for dialog compatibility
+        current_paths = [p['path'] for p in self.projects_data]
+        try:
+            dialog = CustomFolderDialog(current_paths, self.ignored_folders, self)
+            if dialog.exec():
+                self.ignored_folders = dialog.selected_paths()
+                self.save_ignored_folders()
+                # Trigger rescan
+                self.scanner = ProjectScannerWorker(self.ignored_folders)
+                self.scanner.finished.connect(self.on_scan_finished)
+                self.scanner.start()
+        except NameError:
+            QMessageBox.information(self, "Info", "CustomFolderDialog module not found.")
 
     def init_ui(self):
         self.setWindowTitle("VS Code Project Launcher")
@@ -223,11 +336,6 @@ class VSCodeLauncher(QMainWindow):
         search_widget = self.create_search_bar()
         main_layout.addWidget(search_widget)
 
-        if not self.projects:
-            self.show_no_projects_message()
-            QTimer.singleShot(2000, self.close)
-            return
-
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
         self.scroll_area.setFrameShape(QFrame.Shape.NoFrame)
@@ -238,19 +346,14 @@ class VSCodeLauncher(QMainWindow):
             QScrollBar::handle:vertical:hover { background: #4e4e52; }
         """)
 
-        scroll_content = QWidget()
-        scroll_content.setStyleSheet("background: transparent;")
-        self.grid_layout = QGridLayout(scroll_content)
+        self.scroll_content = QWidget()
+        self.scroll_content.setStyleSheet("background: transparent;")
+        self.grid_layout = QGridLayout(self.scroll_content)
         self.grid_layout.setSpacing(20)
         self.grid_layout.setContentsMargins(30, 30, 30, 30)
 
-        self.populate_projects()
-        self.scroll_area.setWidget(scroll_content)
+        self.scroll_area.setWidget(self.scroll_content)
         main_layout.addWidget(self.scroll_area)
-
-    def resizeEvent(self, event):
-        self.resize_timer.start()
-        super().resizeEvent(event)
 
     def create_header(self):
         header = QFrame()
@@ -267,7 +370,7 @@ class VSCodeLauncher(QMainWindow):
         layout.addWidget(title)
         layout.addStretch()
 
-        self.count_label = QLabel(f"{len(self.projects)} projects")
+        self.count_label = QLabel("Loading...")
         self.count_label.setStyleSheet("font-size: 13px; color: rgba(255, 255, 255, 0.8); background: transparent; margin-right: 20px;")
         layout.addWidget(self.count_label)
         
@@ -304,17 +407,11 @@ class VSCodeLauncher(QMainWindow):
         if self.isMaximized():
             self.showNormal()
             self.background_frame.setStyleSheet("#backgroundFrame { background-color: #1e1e1e; border-radius: 15px; }")
-            self.header.setStyleSheet("""
-                QFrame { background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #007acc, stop:1 #005a9e);
-                         border-top-left-radius: 14px; border-top-right-radius: 14px; }
-            """)
+            self.header.setStyleSheet("QFrame { background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #007acc, stop:1 #005a9e); border-top-left-radius: 14px; border-top-right-radius: 14px; }")
         else:
             self.showMaximized()
             self.background_frame.setStyleSheet("#backgroundFrame { background-color: #1e1e1e; border-radius: 0px; }")
-            self.header.setStyleSheet("""
-                QFrame { background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #007acc, stop:1 #005a9e);
-                         border-top-left-radius: 0px; border-top-right-radius: 0px; }
-            """)
+            self.header.setStyleSheet("QFrame { background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #007acc, stop:1 #005a9e); border-top-left-radius: 0px; border-top-right-radius: 0px; }")
 
     def mousePressEvent(self, event: QMouseEvent):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -348,46 +445,58 @@ class VSCodeLauncher(QMainWindow):
         layout.addWidget(self.search_input)
         return search_widget
     
-    def populate_projects(self):
+    def resizeEvent(self, event):
+        self.resize_timer.start()
+        super().resizeEvent(event)
+
+    def populate_projects(self, projects_to_show=None):
+        # Clear existing items
         for i in reversed(range(self.grid_layout.count())): 
             widget = self.grid_layout.itemAt(i).widget()
             if widget: widget.setParent(None)
         
+        data_list = projects_to_show if projects_to_show is not None else self.projects_data
+
         BUTTON_WIDTH, HORIZONTAL_SPACING = 180, self.grid_layout.horizontalSpacing()
         margins = self.grid_layout.contentsMargins()
         GRID_HORIZONTAL_MARGINS = margins.left() + margins.right()
+        
+        # Calculate columns
         try:
-            available_width = self.scroll_area.viewport().width() - GRID_HORIZONTAL_MARGINS
+            viewport_width = self.scroll_area.viewport().width()
+            if viewport_width == 0: viewport_width = self.width()
+            available_width = viewport_width - GRID_HORIZONTAL_MARGINS
         except AttributeError:
             available_width = self.width() - GRID_HORIZONTAL_MARGINS
+        
         cols = max(1, (available_width + HORIZONTAL_SPACING) // (BUTTON_WIDTH + HORIZONTAL_SPACING))
 
-        for i, project_path in enumerate(self.filtered_projects):
+        for i, proj_data in enumerate(data_list):
             row, col = i // cols, i % cols
-            icon_path = find_project_icon(project_path)
-            btn = ProjectButton(os.path.basename(project_path), project_path, icon_path=icon_path)
-            btn.clicked.connect(lambda checked, p=project_path: self.open_project(p))
+            btn = ProjectButton(proj_data)
+            btn.clicked.connect(lambda checked, p=proj_data['path']: self.open_project(p))
             self.grid_layout.addWidget(btn, row, col)
     
     def filter_projects(self):
         search_text = self.search_input.text().lower()
-        self.filtered_projects = [p for p in self.projects if search_text in os.path.basename(p).lower()]
-        self.count_label.setText(f"{len(self.filtered_projects)} projects")
-        self.populate_projects()
+        filtered = [p for p in self.projects_data if search_text in p['name'].lower()]
+        self.populate_projects(filtered)
     
     def open_project(self, path):
-        vscode_exe = find_vscode_executable()
-        if not vscode_exe:
+        # Use cached exe if available, otherwise try to find it one last time
+        if not self.vscode_exe:
+             # Fallback if the thread hasn't finished or failed
+             scanner = ProjectScannerWorker([])
+             self.vscode_exe = scanner.find_vscode_executable()
+
+        if not self.vscode_exe:
             QMessageBox.critical(self, "Error", "Could not find VS Code executable (Code.exe).")
             return
         try:
-            subprocess.Popen([vscode_exe, path], creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0)
-            QTimer.singleShot(1000, self.close)
+            subprocess.Popen([self.vscode_exe, path], creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0)
+            QTimer.singleShot(500, self.close)
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to open project: {e}")
-    
-    def show_no_projects_message(self):
-        QMessageBox.information(self, "No Projects", "No recent VS Code projects found.")
 
 def main():
     app = QApplication(sys.argv)
