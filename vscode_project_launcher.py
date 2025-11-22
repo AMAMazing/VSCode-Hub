@@ -2,22 +2,26 @@ import os
 import json
 import subprocess
 import sys
+import ctypes  # <--- Added for memory trimming
 from urllib.parse import unquote
 import logging
 from datetime import datetime
+
+# PyQt Imports
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QGridLayout, QPushButton, QScrollArea,
-                             QLabel, QMessageBox, QLineEdit, QFrame)
+                             QLabel, QMessageBox, QLineEdit, QFrame, QSystemTrayIcon,
+                             QMenu)
 from PyQt6.QtCore import Qt, QTimer, QPoint, QSize, QRectF, QThread, pyqtSignal
-from PyQt6.QtGui import QIcon, QPalette, QColor, QFont, QPainter, QMouseEvent, QPixmap
+from PyQt6.QtGui import QIcon, QPalette, QColor, QFont, QPainter, QMouseEvent, QPixmap, QAction
 from PyQt6.QtSvg import QSvgRenderer
+from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 
 # Attempt imports for your custom modules
 try:
     from svg_icons import SVG_ICONS
     from custom_folder_dialog import CustomFolderDialog
 except ImportError:
-    # Fallback if running standalone for testing without local modules
     SVG_ICONS = {} 
     class CustomFolderDialog: pass
 
@@ -25,17 +29,17 @@ logging.basicConfig(filename='launcher.log', level=logging.INFO, format='%(ascti
 
 CACHE_FILE = 'project_cache.json'
 CONFIG_FILE = 'launcher_config.json'
+SOCKET_NAME = 'VSCodeLauncherInstance'
 
-# --- WORKER THREAD FOR BACKGOUND LOADING ---
+# --- WORKER THREAD ---
 class ProjectScannerWorker(QThread):
-    finished = pyqtSignal(list, str) # Returns project list and vscode path
+    finished = pyqtSignal(list, str) 
 
     def __init__(self, ignored_folders):
         super().__init__()
         self.ignored_folders = ignored_folders
 
     def find_vscode_executable(self):
-        # Check config first
         if os.path.exists(CONFIG_FILE):
             try:
                 with open(CONFIG_FILE, 'r') as f:
@@ -46,7 +50,6 @@ class ProjectScannerWorker(QThread):
             except:
                 pass
 
-        logging.info("Searching for VS Code executable...")
         appdata_path = os.environ.get('LOCALAPPDATA', '')
         program_files = os.environ.get('ProgramFiles', '')
         program_files_x86 = os.environ.get('ProgramFiles(x86)', '')
@@ -76,7 +79,6 @@ class ProjectScannerWorker(QThread):
             except:
                 pass
         
-        # Save to config if found
         if found_path:
             with open(CONFIG_FILE, 'w') as f:
                 json.dump({'vscode_path': found_path}, f)
@@ -84,17 +86,12 @@ class ProjectScannerWorker(QThread):
         return found_path
 
     def find_project_icon(self, project_path):
-        # Optimized: Only look for specific names instead of scanning entire dir
         common_names = ['favicon.ico', 'icon.ico', 'logo.ico', 'app.ico']
         try:
-            # Quick check for common names first (faster than listdir)
             for name in common_names:
                 p = os.path.join(project_path, name)
                 if os.path.exists(p):
                     return p
-            
-            # Fallback to listdir if specific names fail (slower but thorough)
-            # Limit to first 50 files to prevent hanging on massive folders
             files = os.listdir(project_path)
             for item in files[:50]: 
                 if item.lower().endswith('.ico'):
@@ -105,7 +102,6 @@ class ProjectScannerWorker(QThread):
 
     def run(self):
         vscode_path = self.find_vscode_executable()
-        
         try:
             possible_paths = [
                 os.path.join(os.environ['APPDATA'], 'Code', 'User', 'globalStorage', 'storage.json'),
@@ -126,22 +122,16 @@ class ProjectScannerWorker(QThread):
                 storage_data = json.load(f)
             
             project_uris = list(storage_data.get('profileAssociations', {}).get('workspaces', {}).keys())
-            
             final_projects = []
             
             for uri in project_uris:
                 if uri.startswith('file:///'):
                     path = unquote(uri[8:]).replace('/', '\\\\')
-                    
-                    # Skip if ignored
                     if path in self.ignored_folders:
                         continue
-
-                    # Expensive OS checks happen here, in the background
                     if os.path.isdir(path):
                         mtime = os.path.getmtime(path)
                         icon = self.find_project_icon(path)
-                        
                         final_projects.append({
                             "path": path,
                             "name": os.path.basename(path),
@@ -149,10 +139,7 @@ class ProjectScannerWorker(QThread):
                             "icon": icon
                         })
 
-            # Sort by date modified
             final_projects.sort(key=lambda x: x['mtime'], reverse=True)
-            
-            # Save to cache for next run
             with open(CACHE_FILE, 'w') as f:
                 json.dump(final_projects, f)
 
@@ -245,25 +232,82 @@ class VSCodeLauncher(QMainWindow):
     def __init__(self):
         super().__init__()
         self.ignored_folders = self.load_ignored_folders()
-        self.projects_data = [] # List of dicts
+        self.projects_data = []
         self.vscode_exe = None
-        
         self.drag_pos = QPoint()
+        
         self.init_ui()
+        self.setup_tray()
         
-        # 1. Load from cache immediately (Instant UI)
+        # Load cache + Start Scan
         self.load_from_cache()
-        
-        # 2. Start background scanner to refresh data
-        self.scanner = ProjectScannerWorker(self.ignored_folders)
-        self.scanner.finished.connect(self.on_scan_finished)
-        self.scanner.start()
+        self.start_scan()
 
-        # Resize timer logic
         self.resize_timer = QTimer(self)
         self.resize_timer.setSingleShot(True)
         self.resize_timer.setInterval(100)
         self.resize_timer.timeout.connect(self.populate_projects)
+
+    def start_scan(self):
+        self.scanner = ProjectScannerWorker(self.ignored_folders)
+        self.scanner.finished.connect(self.on_scan_finished)
+        self.scanner.start()
+    
+    # --- MEMORY OPTIMIZATION MAGIC ---
+    def trim_memory(self):
+        """
+        Forces Windows to release the Working Set (RAM) of the process.
+        The memory moves to the system page file, dropping RAM usage drastically.
+        """
+        if sys.platform == 'win32':
+            try:
+                ctypes.windll.psapi.EmptyWorkingSet(ctypes.windll.kernel32.GetCurrentProcess())
+            except Exception:
+                pass
+
+    def setup_tray(self):
+        self.tray_icon = QSystemTrayIcon(self)
+        self.tray_icon.setIcon(QIcon("VSCode Hub_icon.ico")) 
+        
+        tray_menu = QMenu()
+        show_action = QAction("Show", self)
+        show_action.triggered.connect(self.show_window)
+        quit_action = QAction("Quit", self)
+        quit_action.triggered.connect(self.force_close)
+        
+        tray_menu.addAction(show_action)
+        tray_menu.addAction(quit_action)
+        self.tray_icon.setContextMenu(tray_menu)
+        self.tray_icon.show()
+        
+        self.tray_icon.activated.connect(self.on_tray_activated)
+
+    def on_tray_activated(self, reason):
+        if reason == QSystemTrayIcon.ActivationReason.Trigger:
+            self.show_window()
+
+    def show_window(self):
+        self.showNormal()
+        self.activateWindow()
+        self.raise_()
+        self.search_input.setFocus()
+        self.search_input.selectAll()
+        self.start_scan()
+
+    def closeEvent(self, event):
+        # Hide and Trim Memory
+        event.ignore()
+        self.hide()
+        self.trim_memory() # <--- CALL HERE
+        self.tray_icon.showMessage(
+            "VS Code Hub",
+            "Minimised to tray. Click the shortcut again to open instantly.",
+            QSystemTrayIcon.MessageIcon.Information,
+            2000
+        )
+
+    def force_close(self):
+        QApplication.instance().quit()
 
     def load_ignored_folders(self):
         try:
@@ -277,7 +321,6 @@ class VSCodeLauncher(QMainWindow):
             json.dump(self.ignored_folders, f, indent=4)
 
     def load_from_cache(self):
-        """Loads data from JSON so UI appears instantly"""
         if os.path.exists(CACHE_FILE):
             try:
                 with open(CACHE_FILE, 'r') as f:
@@ -288,32 +331,25 @@ class VSCodeLauncher(QMainWindow):
                 logging.error(f"Cache load failed: {e}")
 
     def on_scan_finished(self, projects, vscode_path):
-        """Called when background thread finishes scanning files"""
         self.vscode_exe = vscode_path
-        
-        # Check if data actually changed to avoid unnecessary repaint
         current_paths = [p['path'] for p in self.projects_data]
         new_paths = [p['path'] for p in projects]
         
         if current_paths != new_paths:
             self.projects_data = projects
-            self.filter_projects() # Re-run filter/populate
+            self.filter_projects()
             self.count_label.setText(f"{len(self.projects_data)} projects")
         else:
              self.count_label.setText(f"{len(self.projects_data)} projects")
 
     def add_ignored_folder(self):
-        # Passing simple list of paths for dialog compatibility
         current_paths = [p['path'] for p in self.projects_data]
         try:
             dialog = CustomFolderDialog(current_paths, self.ignored_folders, self)
             if dialog.exec():
                 self.ignored_folders = dialog.selected_paths()
                 self.save_ignored_folders()
-                # Trigger rescan
-                self.scanner = ProjectScannerWorker(self.ignored_folders)
-                self.scanner.finished.connect(self.on_scan_finished)
-                self.scanner.start()
+                self.start_scan()
         except NameError:
             QMessageBox.information(self, "Info", "CustomFolderDialog module not found.")
 
@@ -391,12 +427,15 @@ class VSCodeLauncher(QMainWindow):
         minimize_btn = TitleBarButton("minimize")
         minimize_btn.setStyleSheet(btn_style)
         minimize_btn.clicked.connect(self.showMinimized)
+        
         self.maximize_btn = TitleBarButton("maximize")
         self.maximize_btn.setStyleSheet(btn_style)
         self.maximize_btn.clicked.connect(self.toggle_maximize_restore)
+        
         close_btn = TitleBarButton("close")
         close_btn.setStyleSheet(btn_style + "QPushButton:hover { background-color: #E81123; }")
         close_btn.clicked.connect(self.close)
+        
         controls_layout.addWidget(minimize_btn)
         controls_layout.addWidget(self.maximize_btn)
         controls_layout.addWidget(close_btn)
@@ -450,18 +489,14 @@ class VSCodeLauncher(QMainWindow):
         super().resizeEvent(event)
 
     def populate_projects(self, projects_to_show=None):
-        # Clear existing items
         for i in reversed(range(self.grid_layout.count())): 
             widget = self.grid_layout.itemAt(i).widget()
             if widget: widget.setParent(None)
         
         data_list = projects_to_show if projects_to_show is not None else self.projects_data
-
         BUTTON_WIDTH, HORIZONTAL_SPACING = 180, self.grid_layout.horizontalSpacing()
         margins = self.grid_layout.contentsMargins()
         GRID_HORIZONTAL_MARGINS = margins.left() + margins.right()
-        
-        # Calculate columns
         try:
             viewport_width = self.scroll_area.viewport().width()
             if viewport_width == 0: viewport_width = self.width()
@@ -483,9 +518,7 @@ class VSCodeLauncher(QMainWindow):
         self.populate_projects(filtered)
     
     def open_project(self, path):
-        # Use cached exe if available, otherwise try to find it one last time
         if not self.vscode_exe:
-             # Fallback if the thread hasn't finished or failed
              scanner = ProjectScannerWorker([])
              self.vscode_exe = scanner.find_vscode_executable()
 
@@ -494,12 +527,28 @@ class VSCodeLauncher(QMainWindow):
             return
         try:
             subprocess.Popen([self.vscode_exe, path], creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0)
-            QTimer.singleShot(500, self.close)
+            self.hide()
+            self.trim_memory() # <--- Trim on launch too
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to open project: {e}")
 
 def main():
     app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False) 
+
+    socket = QLocalSocket()
+    socket.connectToServer(SOCKET_NAME)
+    
+    if socket.waitForConnected(500):
+        socket.write(b"SHOW")
+        socket.flush()
+        socket.waitForBytesWritten(1000)
+        sys.exit(0)
+    
+    server = QLocalServer()
+    QLocalServer.removeServer(SOCKET_NAME)
+    server.listen(SOCKET_NAME)
+    
     app.setStyle('Fusion')
     font = QFont("Segoe UI", 10)
     app.setFont(font)
@@ -508,8 +557,16 @@ def main():
     window.setWindowFlag(Qt.WindowType.FramelessWindowHint)
     window.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
     
+    def handle_connection():
+        client_socket = server.nextPendingConnection()
+        if client_socket.waitForReadyRead(1000):
+            command = client_socket.readAll().data().decode()
+            if command == "SHOW":
+                window.show_window()
+
+    server.newConnection.connect(handle_connection)
+
     window.show()
-    
     sys.exit(app.exec())
 
 if __name__ == "__main__":

@@ -129,3 +129,4 @@ vscode_project_launcher.dist
 vscode_project_launcher.onefile-build
 vscode_project_launcher.exe
 project_cache.json
+nuitka-crash-report.xml
