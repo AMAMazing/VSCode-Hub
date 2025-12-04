@@ -540,7 +540,7 @@ class VSCodeLauncher(QMainWindow):
     
     def open_project(self, path):
         # 1. Set the text
-        self.search_input.setText("hello world")
+        self.search_input.setText("")
         
         # 2. Force PyQt to process the change immediately.
         # This makes the app wait until the text is set and the grid is filtered 
