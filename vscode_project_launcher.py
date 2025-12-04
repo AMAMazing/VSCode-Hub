@@ -2,7 +2,7 @@ import os
 import json
 import subprocess
 import sys
-import ctypes  # <--- Added for memory trimming
+import ctypes
 from urllib.parse import unquote
 import logging
 from datetime import datetime
@@ -22,6 +22,7 @@ try:
     from svg_icons import SVG_ICONS
     from custom_folder_dialog import CustomFolderDialog
 except ImportError:
+    # Fallback if running standalone or missing files
     SVG_ICONS = {} 
     class CustomFolderDialog: pass
 
@@ -31,7 +32,7 @@ CACHE_FILE = 'project_cache.json'
 CONFIG_FILE = 'launcher_config.json'
 SOCKET_NAME = 'VSCodeLauncherInstance'
 
-# --- WORKER THREAD ---
+# --- WORKER THREAD FOR BACKGROUND SCANNING ---
 class ProjectScannerWorker(QThread):
     finished = pyqtSignal(list, str) 
 
@@ -40,6 +41,7 @@ class ProjectScannerWorker(QThread):
         self.ignored_folders = ignored_folders
 
     def find_vscode_executable(self):
+        # Check config first
         if os.path.exists(CONFIG_FILE):
             try:
                 with open(CONFIG_FILE, 'r') as f:
@@ -50,6 +52,7 @@ class ProjectScannerWorker(QThread):
             except:
                 pass
 
+        logging.info("Searching for VS Code executable...")
         appdata_path = os.environ.get('LOCALAPPDATA', '')
         program_files = os.environ.get('ProgramFiles', '')
         program_files_x86 = os.environ.get('ProgramFiles(x86)', '')
@@ -88,10 +91,12 @@ class ProjectScannerWorker(QThread):
     def find_project_icon(self, project_path):
         common_names = ['favicon.ico', 'icon.ico', 'logo.ico', 'app.ico']
         try:
+            # Quick check for common names first
             for name in common_names:
                 p = os.path.join(project_path, name)
                 if os.path.exists(p):
                     return p
+            # Fallback to scanning dir (limit 50 files)
             files = os.listdir(project_path)
             for item in files[:50]: 
                 if item.lower().endswith('.ico'):
@@ -127,8 +132,10 @@ class ProjectScannerWorker(QThread):
             for uri in project_uris:
                 if uri.startswith('file:///'):
                     path = unquote(uri[8:]).replace('/', '\\\\')
+                    
                     if path in self.ignored_folders:
                         continue
+
                     if os.path.isdir(path):
                         mtime = os.path.getmtime(path)
                         icon = self.find_project_icon(path)
@@ -140,6 +147,7 @@ class ProjectScannerWorker(QThread):
                         })
 
             final_projects.sort(key=lambda x: x['mtime'], reverse=True)
+            
             with open(CACHE_FILE, 'w') as f:
                 json.dump(final_projects, f)
 
@@ -252,13 +260,9 @@ class VSCodeLauncher(QMainWindow):
         self.scanner = ProjectScannerWorker(self.ignored_folders)
         self.scanner.finished.connect(self.on_scan_finished)
         self.scanner.start()
-    
-    # --- MEMORY OPTIMIZATION MAGIC ---
+
     def trim_memory(self):
-        """
-        Forces Windows to release the Working Set (RAM) of the process.
-        The memory moves to the system page file, dropping RAM usage drastically.
-        """
+        """Forces Windows to trim working set memory"""
         if sys.platform == 'win32':
             try:
                 ctypes.windll.psapi.EmptyWorkingSet(ctypes.windll.kernel32.GetCurrentProcess())
@@ -295,10 +299,10 @@ class VSCodeLauncher(QMainWindow):
         self.start_scan()
 
     def closeEvent(self, event):
-        # Hide and Trim Memory
+        # Hide window and Trim Memory
         event.ignore()
         self.hide()
-        self.trim_memory() # <--- CALL HERE
+        self.trim_memory()
         self.tray_icon.showMessage(
             "VS Code Hub",
             "Minimised to tray. Click the shortcut again to open instantly.",
@@ -384,6 +388,8 @@ class VSCodeLauncher(QMainWindow):
 
         self.scroll_content = QWidget()
         self.scroll_content.setStyleSheet("background: transparent;")
+        
+        # Grid Layout Setup
         self.grid_layout = QGridLayout(self.scroll_content)
         self.grid_layout.setSpacing(20)
         self.grid_layout.setContentsMargins(30, 30, 30, 30)
@@ -489,11 +495,19 @@ class VSCodeLauncher(QMainWindow):
         super().resizeEvent(event)
 
     def populate_projects(self, projects_to_show=None):
+        # 1. Clean up existing widgets
         for i in reversed(range(self.grid_layout.count())): 
             widget = self.grid_layout.itemAt(i).widget()
             if widget: widget.setParent(None)
         
+        # 2. Reset any previous layout stretches
+        for r in range(self.grid_layout.rowCount()):
+            self.grid_layout.setRowStretch(r, 0)
+        for c in range(self.grid_layout.columnCount()):
+            self.grid_layout.setColumnStretch(c, 0)
+
         data_list = projects_to_show if projects_to_show is not None else self.projects_data
+
         BUTTON_WIDTH, HORIZONTAL_SPACING = 180, self.grid_layout.horizontalSpacing()
         margins = self.grid_layout.contentsMargins()
         GRID_HORIZONTAL_MARGINS = margins.left() + margins.right()
@@ -506,11 +520,18 @@ class VSCodeLauncher(QMainWindow):
         
         cols = max(1, (available_width + HORIZONTAL_SPACING) // (BUTTON_WIDTH + HORIZONTAL_SPACING))
 
+        # 3. Add Buttons
+        last_row = 0
         for i, proj_data in enumerate(data_list):
             row, col = i // cols, i % cols
+            last_row = row
             btn = ProjectButton(proj_data)
             btn.clicked.connect(lambda checked, p=proj_data['path']: self.open_project(p))
             self.grid_layout.addWidget(btn, row, col)
+            
+        # 4. Add spacer at bottom and right to force Top-Left alignment
+        self.grid_layout.setRowStretch(last_row + 1, 1)
+        self.grid_layout.setColumnStretch(cols, 1)
     
     def filter_projects(self):
         search_text = self.search_input.text().lower()
@@ -519,8 +540,8 @@ class VSCodeLauncher(QMainWindow):
     
     def open_project(self, path):
         if not self.vscode_exe:
-             scanner = ProjectScannerWorker([])
-             self.vscode_exe = scanner.find_vscode_executable()
+            scanner = ProjectScannerWorker([])
+            self.vscode_exe = scanner.find_vscode_executable()
 
         if not self.vscode_exe:
             QMessageBox.critical(self, "Error", "Could not find VS Code executable (Code.exe).")
@@ -528,24 +549,30 @@ class VSCodeLauncher(QMainWindow):
         try:
             subprocess.Popen([self.vscode_exe, path], creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0)
             self.hide()
-            self.trim_memory() # <--- Trim on launch too
+            self.trim_memory()
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to open project: {e}")
+
+
 
 def main():
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False) 
 
+    # --- SINGLE INSTANCE CHECK ---
     socket = QLocalSocket()
     socket.connectToServer(SOCKET_NAME)
     
     if socket.waitForConnected(500):
+        # App is already running. Send "SHOW" command and quit this new instance.
         socket.write(b"SHOW")
         socket.flush()
         socket.waitForBytesWritten(1000)
         sys.exit(0)
     
+    # If we are here, we are the first instance. Create Server.
     server = QLocalServer()
+    # Cleanup previous socket file if it exists (crashed)
     QLocalServer.removeServer(SOCKET_NAME)
     server.listen(SOCKET_NAME)
     
@@ -557,6 +584,7 @@ def main():
     window.setWindowFlag(Qt.WindowType.FramelessWindowHint)
     window.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
     
+    # Handle incoming connections from new instances
     def handle_connection():
         client_socket = server.nextPendingConnection()
         if client_socket.waitForReadyRead(1000):
