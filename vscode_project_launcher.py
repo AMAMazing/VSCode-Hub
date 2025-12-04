@@ -529,9 +529,30 @@ class VSCodeLauncher(QMainWindow):
             btn = ProjectButton(proj_data)
             btn.clicked.connect(lambda checked, p=proj_data['path']: self.open_project(p))
             self.grid_layout.addWidget(btn, row, col)
+        
+        # 4. Calculate optimal window width based on number of items
+        num_items = len(data_list)
+        if num_items > 0:
+            # Calculate how many columns we actually need
+            actual_cols = min(cols, num_items)
+            optimal_width = (actual_cols * BUTTON_WIDTH) + ((actual_cols - 1) * HORIZONTAL_SPACING) + GRID_HORIZONTAL_MARGINS + 20
             
-        # 4. Add spacer at bottom only to push content to top
+            # Add width for scrollbar if needed
+            if last_row >= 3:  # If more than 3 rows, likely to have scrollbar
+                optimal_width += 20
+            
+            # Resize window to fit content (with min/max bounds)
+            if not self.isMaximized():
+                current_width = self.width()
+                min_width = 1054
+                max_width = 1600
+                new_width = max(min_width, min(max_width, optimal_width))
+                if abs(current_width - new_width) > 50:  # Only resize if significant difference
+                    self.resize(new_width, self.height())
+            
+        # 5. Add spacer at bottom and right to force Top-Left alignment
         self.grid_layout.setRowStretch(last_row + 1, 1)
+        self.grid_layout.setColumnStretch(cols, 1)
     
     def filter_projects(self):
         search_text = self.search_input.text().lower()
