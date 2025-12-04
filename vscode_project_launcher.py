@@ -6,13 +6,14 @@ import ctypes
 from urllib.parse import unquote
 import logging
 from datetime import datetime
+from time import sleep
 
 # PyQt Imports
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QGridLayout, QPushButton, QScrollArea,
                              QLabel, QMessageBox, QLineEdit, QFrame, QSystemTrayIcon,
                              QMenu)
-from PyQt6.QtCore import Qt, QTimer, QPoint, QSize, QRectF, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, QPoint, QSize, QRectF, QThread, pyqtSignal, QEventLoop
 from PyQt6.QtGui import QIcon, QPalette, QColor, QFont, QPainter, QMouseEvent, QPixmap, QAction
 from PyQt6.QtSvg import QSvgRenderer
 from PyQt6.QtNetwork import QLocalServer, QLocalSocket
@@ -529,9 +530,8 @@ class VSCodeLauncher(QMainWindow):
             btn.clicked.connect(lambda checked, p=proj_data['path']: self.open_project(p))
             self.grid_layout.addWidget(btn, row, col)
             
-        # 4. Add spacer at bottom and right to force Top-Left alignment
+        # 4. Add spacer at bottom only to push content to top
         self.grid_layout.setRowStretch(last_row + 1, 1)
-        self.grid_layout.setColumnStretch(cols, 1)
     
     def filter_projects(self):
         search_text = self.search_input.text().lower()
@@ -539,6 +539,15 @@ class VSCodeLauncher(QMainWindow):
         self.populate_projects(filtered)
     
     def open_project(self, path):
+        # 1. Set the text
+        self.search_input.setText("hello world")
+        
+        # 2. Force PyQt to process the change immediately.
+        # This makes the app wait until the text is set and the grid is filtered 
+        # before running the next lines of code.
+        QApplication.processEvents()
+
+        # --- The rest of your logic follows below ---
         if not self.vscode_exe:
             scanner = ProjectScannerWorker([])
             self.vscode_exe = scanner.find_vscode_executable()
